@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#define DDIO_DEFAULT_SHM_NAME "ddio_default_sharedmem"
+#define DDIO_SHM_TRUNC_BYTES  0x1000
+#define DDIO_SHM_MAP_BYTES    0x28
+
 typedef enum {
 	MLC_STATE_INIT = 0,
 	MLC_STATE_MEM_ALLOC_DONE = 1,
@@ -28,19 +32,60 @@ typedef enum {
 	PCIE_STATE_PROGRAM_DONE = 7
 } pcie_ddio_state_t;
 
+typedef enum {
+	DDIO_SESSION_NONE = 0,
+	DDIO_SESSION_SHM_VALID = 1,
+	DDIO_SESSION_MLC_ALLOC_DONE = 2,
+	DDIO_SESSION_PRODUCER_DONE = 3,
+	DDIO_SESSION_CONSUMER_DONE = 4,
+	DDIO_SESSION_TEST_DONE = 5,
+	DDIO_SESSION_UNLINKED = 6
+} ddio_session_state_t;
+
+typedef enum {
+	DDIO_TEST_TYPE_UNSET = 0,
+	DDIO_TEST_TYPE_MLC_PRODUCER = 1,
+	DDIO_TEST_TYPE_PCIE_PRODUCER = 2
+} ddio_test_type_t;
+
+/*
+ * Exact 40-byte (0x28) shared-memory ABI matching intel/mlc FUN_0012f1e0 &
+ * FUN_0012f6f0.
+ */
 typedef struct {
-	int32_t session_id;	// +0x00
-	int32_t mlc_state;	// +0x04
-	int32_t pcie_state;	// +0x08
-	int32_t lock;		// +0x0C
-	int32_t session_state;	// +0x10
-	char reserved[44];
-} __attribute__((packed)) ddio_shm_config_t;
+	int32_t session_id;	/* +0x00 */
+	int32_t mlc_state;	/* +0x04 */
+	int32_t pcie_state;	/* +0x08 */
+	int32_t lock;		/* +0x0C: atomic xchg spinlock */
+	int32_t session_state;	/* +0x10 */
+	int32_t type;		/* +0x14: 1=MLC setup for PCIe, 2=PCIe setup for MLC */
+	int32_t numcpus;	/* +0x18 */
+	int32_t currcpus;	/* +0x1C */
+	int32_t mlc_unlink;	/* +0x20 */
+	int32_t pcie_unlink;	/* +0x24 */
+} ddio_shm_config_t;
 
-/* Print DDIO session configuration and state status */
-void ddio_print_config(const ddio_shm_config_t * cfg);
+_Static_assert(sizeof(ddio_shm_config_t) == DDIO_SHM_MAP_BYTES,
+	       "ddio_shm_config_t must be exactly 40 (0x28) bytes");
 
-/* Run Intel DDIO shared memory PCIe handshake benchmark */
-int run_ddio_benchmark(const char *shm_name, double duration_sec);
+/* Global CLI configuration setters & query */
+void ddio_configure(bool enabled, const char *shm_name, int32_t session_id,
+		    int32_t test_type, int32_t slowmode_ms, bool verbose);
+bool ddio_is_enabled(void);
+
+/* Atomic spinlock primitives matching FUN_0012f180 / FUN_0012f1b0 */
+void ddio_lock(volatile int32_t *lock_word);
+void ddio_unlock(volatile int32_t *lock_word);
+
+/* Print DDIO session configuration and state status (FUN_0012f1e0) */
+void ddio_print_config(const volatile ddio_shm_config_t *cfg);
+
+/* Lifecycle hooks for get_bw_and_latency (FUN_001229e0) and ThruputThread (FUN_00120430) */
+int ddio_open_shm(void);
+void ddio_close_shm(void);
+int ddio_step_begin(int numcpus);
+void ddio_worker_enter(bool *out_is_leader);
+void ddio_worker_exit(bool is_leader);
+void ddio_step_end(void);
 
 #endif /* DDIO_H */

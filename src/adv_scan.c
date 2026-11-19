@@ -36,13 +36,6 @@ uint64_t pagemap_get_phys_addr(void *vaddr)
 	return 0;
 }
 
-static void hugepages_sig_handler(int sig)
-{
-	(void)sig;
-	restore_1gb_hugepages();
-	exit(1);
-}
-
 int reserve_1gb_hugepages(int numa_node, int pages_needed)
 {
 	char path[256];
@@ -63,9 +56,6 @@ int reserve_1gb_hugepages(int numa_node, int pages_needed)
 	if (g_saved_1gb_count < 0) {
 		g_saved_1gb_node = numa_node;
 		g_saved_1gb_count = curr;
-
-		signal(SIGINT, hugepages_sig_handler);
-		signal(SIGTERM, hugepages_sig_handler);
 	}
 
 	if (curr < pages_needed) {
@@ -78,17 +68,44 @@ int reserve_1gb_hugepages(int numa_node, int pages_needed)
 	return 0;
 }
 
+/* Async-signal-safe restoration of 1GB hugepage count */
 void restore_1gb_hugepages(void)
 {
 	if (g_saved_1gb_count >= 0 && g_saved_1gb_node >= 0) {
-		char path[256];
-		snprintf(path, sizeof(path),
-			 "/sys/devices/system/node/node%d/hugepages/hugepages-1048576kB/nr_hugepages",
-			 g_saved_1gb_node);
-		FILE *f = fopen(path, "w");
-		if (f) {
-			fprintf(f, "%d\n", g_saved_1gb_count);
-			fclose(f);
+		static const char pfx[] = "/sys/devices/system/node/node";
+		static const char sfx[] =
+		    "/hugepages/hugepages-1048576kB/nr_hugepages";
+		char path[160];
+		char digits[16];
+		int n = 0, pos = 0;
+		unsigned int u = (unsigned int)g_saved_1gb_node;
+		do {
+			digits[n++] = (char)('0' + (u % 10U));
+			u /= 10U;
+		} while (u > 0U && n < (int)sizeof(digits));
+		for (int i = 0; pfx[i] != '\0'; i++)
+			path[pos++] = pfx[i];
+		while (n > 0)
+			path[pos++] = digits[--n];
+		for (int i = 0; sfx[i] != '\0'; i++)
+			path[pos++] = sfx[i];
+		path[pos] = '\0';
+
+		int fd = open(path, O_WRONLY | O_TRUNC);
+		if (fd >= 0) {
+			char valbuf[24];
+			int vn = 0, vpos = 0;
+			unsigned int vu = (unsigned int)g_saved_1gb_count;
+			do {
+				digits[vn++] = (char)('0' + (vu % 10U));
+				vu /= 10U;
+			} while (vu > 0U && vn < (int)sizeof(digits));
+			while (vn > 0)
+				valbuf[vpos++] = digits[--vn];
+			valbuf[vpos++] = '\n';
+			ssize_t wr = write(fd, valbuf, (size_t)vpos);
+			(void)wr;
+			close(fd);
 		}
 		g_saved_1gb_count = -1;
 		g_saved_1gb_node = -1;
@@ -103,7 +120,9 @@ void run_latency_histogram(size_t buf_size_mb, int bucket_granularity_ns)
 	}
 
 	size_t size = buf_size_mb * 1024 * 1024;
-	void *buf = alloc_mem_onnode(size, 0, HUGEPAGE_NONE);
+	const numa_node_info_t *n0 = numa_get_node(0);
+	int alloc_nid = (n0 && n0->has_memory) ? n0->node_id : -1;
+	void *buf = alloc_mem_onnode(size, alloc_nid, HUGEPAGE_NONE);
 	if (!buf) {
 		fprintf(stderr, "Buffer allocation failed!\n");
 		return;

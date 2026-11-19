@@ -7,21 +7,25 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
-#include <signal.h>
 #include <cpuid.h>
 #include <immintrin.h>
 #include "helper.h"
-
-#define MAX_TRACKED_CPUS 512
+#include "allocation.h"
 
 static double g_tsc_freq_ghz = 2.5;
 static int g_total_cpus = 0;
 static bool g_msr_available = false;
-static bool g_prefetchers_disabled = false;
+static bool g_is_amd = false;
+static bool g_is_amd_zen3_plus = false;
+static uint32_t g_cpu_family = 0;
+static uint32_t g_cpu_model = 0;
 static uint32_t g_msr_register = INTEL_MSR_PREFETCH_CONTROL;
 static uint64_t g_disable_mask = INTEL_PREFETCH_DISABLE_MASK;
-static uint64_t g_orig_values[MAX_TRACKED_CPUS];
-static bool g_cpu_modified[MAX_TRACKED_CPUS];
+static uint64_t g_enable_clear_mask = INTEL_PREFETCH_DISABLE_MASK;
+static uint64_t g_orig_values[MAX_CPUS];
+static bool g_orig_valid[MAX_CPUS];
+static bool g_orig_saved = false;
+static volatile bool g_msr_dirty = false;
 
 void helper_init_tsc(void)
 {
@@ -46,77 +50,234 @@ double helper_get_tsc_freq_ghz(void)
 	return g_tsc_freq_ghz;
 }
 
-static void signal_handler(int sig)
+/* Async-signal-safe formatter for "/dev/cpu/<hwid>/msr" */
+static void format_msr_path(char *buf, int hwid)
 {
-	(void)sig;
-	msr_restore_prefetchers();
-	_exit(1);
+	static const char prefix[] = "/dev/cpu/";
+	static const char suffix[] = "/msr";
+	char digits[16];
+	int n = 0;
+	unsigned int u = (hwid < 0) ? 0U : (unsigned int)hwid;
+
+	do {
+		digits[n++] = (char)('0' + (u % 10U));
+		u /= 10U;
+	} while (u > 0U && n < (int)sizeof(digits));
+
+	int pos = 0;
+	for (int i = 0; prefix[i] != '\0'; i++)
+		buf[pos++] = prefix[i];
+	while (n > 0)
+		buf[pos++] = digits[--n];
+	for (int i = 0; suffix[i] != '\0'; i++)
+		buf[pos++] = suffix[i];
+	buf[pos] = '\0';
 }
 
-static bool read_msr(int cpu, uint32_t reg, uint64_t *val)
+static bool read_msr(int hwid, uint32_t reg, uint64_t *val, bool verbose)
 {
 	char path[64];
-	snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
+	format_msr_path(path, hwid);
 	int fd = open(path, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
+		if (verbose)
+			printf("Failed to open /dev/cpu/%d/msr\n", hwid);
 		return false;
-	ssize_t ret = pread(fd, val, sizeof(uint64_t), reg);
+	}
+	ssize_t ret = pread(fd, val, sizeof(uint64_t), (off_t)reg);
 	close(fd);
-	return ret == sizeof(uint64_t);
+	if (ret != (ssize_t)sizeof(uint64_t)) {
+		if (verbose)
+			puts("MSR fread error!");
+		return false;
+	}
+	return true;
 }
 
-static bool write_msr(int cpu, uint32_t reg, uint64_t val)
+static bool write_msr(int hwid, uint32_t reg, uint64_t val, bool verbose)
 {
 	char path[64];
-	snprintf(path, sizeof(path), "/dev/cpu/%d/msr", cpu);
+	format_msr_path(path, hwid);
 	int fd = open(path, O_WRONLY);
-	if (fd < 0)
+	if (fd < 0) {
+		if (verbose)
+			printf("MSR module not detected. Try 'modprobe msr'");
 		return false;
-	ssize_t ret = pwrite(fd, &val, sizeof(uint64_t), reg);
+	}
+	ssize_t ret = pwrite(fd, &val, sizeof(uint64_t), (off_t)reg);
 	close(fd);
-	return ret == sizeof(uint64_t);
+	if (ret != (ssize_t)sizeof(uint64_t)) {
+		if (verbose)
+			puts("MSR fwrite error!");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Exact microarchitectural prefetcher disable OR-mask selector matching
+ * intel/mlc FUN_0012aa70 (MSR 0x1A4 on Intel).
+ */
+uint64_t msr_calc_intel_disable_mask(uint32_t family, uint32_t model)
+{
+	if (family == 6) {
+		/* Goldmont / Denverton (FUN_0012a2e0) */
+		if (model == 0x5c || model == 0x5f)
+			return 0x05ULL;
+		/* Knights Landing / Knights Mill (FUN_0012a310) */
+		if (model == 0x57 || model == 0x85)
+			return 0x03ULL;
+		/* Alder Lake (FUN_0012a560) */
+		if (model == 0x97 || model == 0x9a || model == 0xbf)
+			return 0x2FULL;
+		/* Panther Lake, Meteor Lake, Lunar Lake, Arrow Lake */
+		if (model == 0xcc || model == 0xcd ||
+		    model == 0xaa || model == 0xab || model == 0xac ||
+		    model == 0xbc || model == 0xbd ||
+		    model == 0xc5 || model == 0xc6)
+			return 0x6FULL;
+		/* Raptor Lake, Sapphire Rapids, Emerald Rapids */
+		if (model == 0xb7 || model == 0xba ||
+		    model == 0x8f || model == 0xcf)
+			return 0x2FULL;
+		/* Granite Rapids (FUN_0012a430) */
+		if (model == 0xad || model == 0xae)
+			return 0xEFULL;
+		/* Sierra Forest / Grand Ridge (FUN_0012a4b0) & Clearwater Forest (FUN_0012a4f0) */
+		if (model == 0xaf || model == 0xb6 || model == 0xdd)
+			return 0x3FULL;
+	}
+	/* Diamond Rapids (FUN_0012a470) & Nova Lake (FUN_0012a6f0) */
+	if ((family == 0x13 && model == 0x01) ||
+	    (family == 0x12 && (model == 0x01 || model == 0x03)))
+		return 0xFFULL;
+
+	return 0x0FULL;
+}
+
+/*
+ * Exact microarchitectural prefetcher enable clear-mask selector matching
+ * intel/mlc FUN_0012ab70 (used as `val & ~clear_mask`).
+ * Note: Sierra Forest / Grand Ridge / Clearwater Forest clear 0x3B (preserving bit 2).
+ */
+uint64_t msr_calc_intel_enable_clear_mask(uint32_t family, uint32_t model)
+{
+	if (family == 6 && (model == 0xaf || model == 0xb6 || model == 0xdd))
+		return 0x3BULL;
+	return msr_calc_intel_disable_mask(family, model);
 }
 
 bool msr_init(int total_cpus)
 {
-	g_total_cpus =
-	    (total_cpus > MAX_TRACKED_CPUS) ? MAX_TRACKED_CPUS : total_cpus;
+	g_total_cpus = (total_cpus > MAX_CPUS) ? MAX_CPUS : total_cpus;
+	if (g_total_cpus < 0)
+		g_total_cpus = 0;
 	memset(g_orig_values, 0, sizeof(g_orig_values));
-	memset(g_cpu_modified, 0, sizeof(g_cpu_modified));
+	memset(g_orig_valid, 0, sizeof(g_orig_valid));
+	g_orig_saved = false;
+	g_msr_dirty = false;
+	g_msr_available = false;
+	g_is_amd = false;
+	g_is_amd_zen3_plus = false;
 
-	unsigned int eax, ebx, ecx, edx;
+	unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+	char vendor[13] = { 0 };
 	if (__get_cpuid(0, &eax, &ebx, &ecx, &edx)) {
-		char vendor[13];
 		memcpy(vendor, &ebx, 4);
 		memcpy(vendor + 4, &edx, 4);
 		memcpy(vendor + 8, &ecx, 4);
 		vendor[12] = '\0';
+	}
 
-		if (strcmp(vendor, "AuthenticAMD") == 0) {
-			g_msr_register = AMD_ZEN3_MSR_PREFETCH_CONTROL;
-			g_disable_mask = 0x01ULL;
+	unsigned int leaf1_eax = 0, leaf1_ebx = 0, leaf1_ecx = 0, leaf1_edx = 0;
+	__get_cpuid(1, &leaf1_eax, &leaf1_ebx, &leaf1_ecx, &leaf1_edx);
+
+	if (strcmp(vendor, "AuthenticAMD") == 0) {
+		uint32_t base_fam = (leaf1_eax >> 8) & 0xfU;
+		if (base_fam == 0xfU) {
+			g_cpu_family = ((leaf1_eax >> 20) & 0xffU) + 0xfU;
+			g_is_amd = true;
+			g_is_amd_zen3_plus = (g_cpu_family > 0x18U);
 		} else {
-			g_msr_register = INTEL_MSR_PREFETCH_CONTROL;
-			g_disable_mask = INTEL_PREFETCH_DISABLE_MASK;
+			g_cpu_family = base_fam;
+			g_is_amd = true;
+			g_is_amd_zen3_plus = false;
 		}
-	}
-
-	uint64_t test_val;
-	if (read_msr(0, g_msr_register, &test_val)) {
-		g_msr_available = true;
+		g_cpu_model =
+		    ((leaf1_eax >> 4) & 0xfU) | ((leaf1_eax >> 12) & 0xf0U);
+		if (g_is_amd_zen3_plus) {
+			g_msr_register = AMD_ZEN3_MSR_PREFETCH_CONTROL;
+			g_disable_mask = 0x2FULL;
+			g_enable_clear_mask = 0x2FULL;
+		} else {
+			g_msr_register = 0;
+			g_disable_mask = 0;
+			g_enable_clear_mask = 0;
+		}
 	} else {
-		g_msr_available = false;
+		/* FUN_00129f70 family/model extraction */
+		uint32_t fam = (leaf1_eax >> 8) & 0xfU;
+		if (fam == 0xfU)
+			fam += (leaf1_eax >> 20) & 0xffU;
+		uint32_t model;
+		if (fam == 6U || fam == 0xfU)
+			model = ((leaf1_eax >> 4) & 0xfU) |
+				((leaf1_eax >> 12) & 0xf0U);
+		else
+			model = (leaf1_eax >> 4) & 0xfU;
+
+		g_cpu_family = fam;
+		g_cpu_model = model;
+		g_msr_register = INTEL_MSR_PREFETCH_CONTROL;
+		g_disable_mask = msr_calc_intel_disable_mask(fam, model);
+		g_enable_clear_mask =
+		    msr_calc_intel_enable_clear_mask(fam, model);
 	}
 
-	atexit(msr_restore_prefetchers);
-	struct sigaction sa;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = signal_handler;
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
-	sigaction(SIGHUP, &sa, NULL);
+	return true;
+}
 
-	return g_msr_available;
+/*
+ * Read-toggle-write-readback-restore capability probe on CPU 0,
+ * matching intel/mlc FUN_0010a910.
+ */
+bool msr_probe_modifiable(bool verbose)
+{
+	if (g_is_amd && !g_is_amd_zen3_plus) {
+		if (verbose) {
+			puts("HW prefetcher cannot be modified as cpu is older than zen3");
+		}
+		g_msr_available = false;
+		return false;
+	}
+
+	int hwid = cpu_get_hwid(0);
+	uint64_t orig = 0;
+	uint64_t verify = 0xffULL;
+
+	if (!read_msr(hwid, g_msr_register, &orig, verbose)) {
+		g_msr_available = false;
+		return false;
+	}
+
+	uint64_t toggled = (orig & 1ULL) ? (orig & ~1ULL) : (orig | 1ULL);
+	if (!write_msr(hwid, g_msr_register, toggled, verbose)) {
+		if (verbose)
+			puts("Unable to read prefetch msr");
+		g_msr_available = false;
+		return false;
+	}
+
+	if (read_msr(hwid, g_msr_register, &verify, verbose) &&
+	    verify == toggled) {
+		write_msr(hwid, g_msr_register, orig, verbose);
+		g_msr_available = true;
+		return true;
+	}
+
+	write_msr(hwid, g_msr_register, orig, false);
+	g_msr_available = false;
+	return false;
 }
 
 bool msr_is_available(void)
@@ -124,53 +285,120 @@ bool msr_is_available(void)
 	return g_msr_available;
 }
 
+bool msr_is_amd(void)
+{
+	return g_is_amd;
+}
+
+bool msr_is_amd_zen3_plus(void)
+{
+	return g_is_amd_zen3_plus;
+}
+
+uint64_t msr_get_disable_mask(void)
+{
+	return g_disable_mask;
+}
+
+uint64_t msr_get_enable_clear_mask(void)
+{
+	return g_enable_clear_mask;
+}
+
+static void msr_save_initial_state(bool verbose)
+{
+	if (g_orig_saved)
+		return;
+	for (int cpu = 0; cpu < g_total_cpus; cpu++) {
+		uint64_t val = 0;
+		if (read_msr(cpu_get_hwid(cpu), g_msr_register, &val, verbose)) {
+			g_orig_values[cpu] = val;
+			g_orig_valid[cpu] = true;
+		}
+	}
+	g_orig_saved = true;
+}
+
+/* Disable hardware prefetchers on all tracked CPUs (FUN_001092b0) */
 int msr_disable_prefetchers(bool verbose)
 {
-	if (!g_msr_available || g_prefetchers_disabled)
+	if (!g_msr_available || g_msr_register == 0)
 		return 0;
+
+	msr_save_initial_state(verbose);
 
 	int modified_count = 0;
 	for (int cpu = 0; cpu < g_total_cpus; cpu++) {
+		int hwid = cpu_get_hwid(cpu);
 		uint64_t val = 0;
-		if (read_msr(cpu, g_msr_register, &val)) {
-			g_orig_values[cpu] = val;
+		if (read_msr(hwid, g_msr_register, &val, verbose)) {
 			uint64_t new_val = val | g_disable_mask;
-			if (write_msr(cpu, g_msr_register, new_val)) {
-				g_cpu_modified[cpu] = true;
+			if (write_msr(hwid, g_msr_register, new_val, verbose)) {
+				g_msr_dirty = true;
 				modified_count++;
 			}
 		}
 	}
-
-	if (modified_count > 0) {
-		g_prefetchers_disabled = true;
-		if (verbose) {
-			printf
-			    ("Hardware prefetchers successfully disabled on %d CPU(s) (MSR 0x%X).\n",
-			     modified_count, g_msr_register);
-		}
-	} else {
-		if (verbose) {
-			printf
-			    ("*** Unable to modify prefetchers (try executing 'modprobe msr' as root)\n");
-		}
-	}
-
 	return modified_count;
 }
 
+/* Enable hardware prefetchers on all tracked CPUs (FUN_00109b90) */
+int msr_enable_prefetchers(bool verbose)
+{
+	if (!g_msr_available || g_msr_register == 0)
+		return 0;
+
+	msr_save_initial_state(verbose);
+
+	int modified_count = 0;
+	for (int cpu = 0; cpu < g_total_cpus; cpu++) {
+		int hwid = cpu_get_hwid(cpu);
+		uint64_t val = 0;
+		if (read_msr(hwid, g_msr_register, &val, verbose)) {
+			uint64_t new_val = val & ~g_enable_clear_mask;
+			if (write_msr(hwid, g_msr_register, new_val, verbose)) {
+				g_msr_dirty = true;
+				modified_count++;
+			}
+		}
+	}
+	return modified_count;
+}
+
+/* Disable hardware prefetchers on a single logical CPU (loaded latency lat_cpu) */
+bool msr_disable_prefetcher_on_cpu(int cpu, bool verbose)
+{
+	if (!g_msr_available || g_msr_register == 0 ||
+	    cpu < 0 || cpu >= g_total_cpus)
+		return false;
+
+	msr_save_initial_state(verbose);
+
+	int hwid = cpu_get_hwid(cpu);
+	uint64_t val = 0;
+	if (!read_msr(hwid, g_msr_register, &val, verbose))
+		return false;
+	if (!write_msr(hwid, g_msr_register, val | g_disable_mask, verbose))
+		return false;
+
+	g_msr_dirty = true;
+	return true;
+}
+
+/* Restore initial pre-MLC MSR values on all tracked CPUs (FUN_0010a7e0) */
 void msr_restore_prefetchers(void)
 {
-	if (!g_prefetchers_disabled)
+	if (!g_msr_available || !g_orig_saved || !g_msr_dirty ||
+	    g_msr_register == 0)
 		return;
 
 	for (int cpu = 0; cpu < g_total_cpus; cpu++) {
-		if (g_cpu_modified[cpu]) {
-			write_msr(cpu, g_msr_register, g_orig_values[cpu]);
-			g_cpu_modified[cpu] = false;
+		if (g_orig_valid[cpu]) {
+			write_msr(cpu_get_hwid(cpu), g_msr_register,
+				  g_orig_values[cpu], false);
 		}
 	}
-	g_prefetchers_disabled = false;
+	g_msr_dirty = false;
 }
 
 void print_usage(void)
